@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,41 +37,118 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
+	for {
+		job := CallGetJob()
 
-	// Your worker implementation here.
+		switch job.Type {
+		case JobTypeMap:
+			fmt.Println("got map job: ", job.Inputs)
+			intermediate := make([]KeyValue, 0)
+			for _, filename := range job.Inputs {
+				file, err := os.Open(filename)
+				if err != nil {
+					log.Fatalf("cannot open %v", filename)
+				}
+				content, err := ioutil.ReadAll(file)
+				if err != nil {
+					log.Fatalf("cannot read %v", filename)
+				}
+				file.Close()
+				kva := mapf(filename, string(content))
+				intermediate = append(intermediate, kva...)
+			}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+			filenames := make([]string, 0, job.NReduce)
+			ofiles := make([]*os.File, 0, job.NReduce)
+			encs := make([]*json.Encoder, 0, job.NReduce)
+			for i := 0; i < job.NReduce; i++ {
+				filename := fmt.Sprintf("mr-%d-%d", job.WorkerId, i)
+				filenames = append(filenames, filename)
+				ofile, _ := os.Create(filename)
+				encs = append(encs, json.NewEncoder(ofile))
+				ofiles = append(ofiles, ofile)
+			}
 
+			for _, kv := range intermediate {
+				x := ihash(kv.Key) % job.NReduce
+				if err := encs[x].Encode(&kv); err != nil {
+					log.Fatal("encode err")
+				}
+			}
+
+			for _, ofile := range ofiles {
+				ofile.Close()
+			}
+			job.Outputs = filenames
+			CallJobDone(job)
+
+		case JobTypeReduce:
+			log.Println("got reduce job: ", job.Inputs)
+
+			kva := make([]KeyValue, 0)
+			for _, filename := range job.Inputs {
+				file, err := os.Open(filename)
+				if err != nil {
+					log.Fatalf("cannot open %v", filename)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					kva = append(kva, kv)
+				}
+				_ = file.Close()
+			}
+			sort.Sort(ByKey(kva))
+
+			oname := fmt.Sprintf("mr-%d-%d", job.WorkerId, job.NReduce)
+			ofile, _ := os.Create(oname)
+
+			for i := 0; i < len(kva); {
+				j := i + 1
+				for j < len(kva) && kva[j].Key == kva[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kva[k].Value)
+				}
+				output := reducef(kva[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+				i = j
+			}
+			_ = ofile.Close()
+			job.Outputs = []string{oname}
+			CallJobDone(job)
+
+		case JobTypeWait:
+			log.Println("got wait job: wait 1 second")
+			time.Sleep(time.Second)
+		case JobTypeFinish:
+			log.Println("job finished!")
+			return
+		default:
+			return
+		}
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func CallGetJob() *Job {
+	job := Job{}
+	call("Coordinator.GetJob", &ExampleArgs{}, &job)
+	return &job
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+func CallJobDone(doneJob *Job) {
+	call("Coordinator.JobDone", doneJob, &ExampleReply{})
 }
 
 //
